@@ -600,8 +600,8 @@ fn parse_id_or_range(spec: &str) -> Result<Vec<usize>> {
         bail!("empty model spec");
     }
 
-    if let Some(batch_spec) = spec.strip_prefix("batch:") {
-        return parse_batch_spec(batch_spec);
+    if let Some(chunk_spec) = spec.strip_prefix("chunk:") {
+        return parse_chunk_spec(chunk_spec);
     }
 
     if let Some((start, end)) = spec.split_once('-') {
@@ -616,26 +616,26 @@ fn parse_id_or_range(spec: &str) -> Result<Vec<usize>> {
     }
 }
 
-fn parse_batch_spec(spec: &str) -> Result<Vec<usize>> {
-    let batches = if let Some((start, end)) = spec.split_once('-') {
+fn parse_chunk_spec(spec: &str) -> Result<Vec<usize>> {
+    let chunks = if let Some((start, end)) = spec.split_once('-') {
         let start = parse_id(start)?;
         let end = parse_id(end)?;
         if start > end {
-            bail!("batch range start is greater than end: batch:{spec}");
+            bail!("chunk range start is greater than end: chunk:{spec}");
         }
         (start..=end).collect()
     } else {
         vec![parse_id(spec)?]
     };
 
-    let mut ids = Vec::with_capacity(batches.len() * CHUNK_SIZE);
-    for batch in batches {
-        let start = batch
+    let mut ids = Vec::with_capacity(chunks.len() * CHUNK_SIZE);
+    for chunk in chunks {
+        let start = chunk
             .checked_mul(CHUNK_SIZE)
-            .ok_or_else(|| anyhow!("batch is too large: {batch}"))?;
+            .ok_or_else(|| anyhow!("chunk is too large: {chunk}"))?;
         let end = start
             .checked_add(CHUNK_SIZE - 1)
-            .ok_or_else(|| anyhow!("batch is too large: {batch}"))?;
+            .ok_or_else(|| anyhow!("chunk is too large: {chunk}"))?;
         ids.extend(start..=end);
     }
     Ok(ids)

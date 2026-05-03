@@ -3,11 +3,11 @@
 Rust library and CLI for downloading selected models from
 [ABC: A Big CAD Dataset](https://deep-geometry.github.io/abc-dataset/).
 
-The CLI supports model ids, ranges, exclusions, and whole ABC batches:
+The CLI supports model ids, ranges, exclusions, and whole ABC chunks:
 
 ```bash
 abcd-downloader download 1 2 3-10 '^5' --formats meta,step,stl
-abcd-downloader download batch:0 --formats featurescript,step,xt --out ~/git/abcd-data
+abcd-downloader download chunk:0 --formats featurescript,step,xt --out ~/git/abcd-data
 abcd-downloader purge
 ```
 
@@ -28,7 +28,7 @@ use abcd_downloader::{DownloadOptions, download, parse_formats};
 
 # async fn example() -> anyhow::Result<()> {
 let mut options = DownloadOptions::default();
-options.model_specs = vec!["batch:0".to_owned()];
+options.model_specs = vec!["chunk:0".to_owned()];
 options.formats = parse_formats("featurescript,step,xt")?;
 options.out_dir = "/tmp/abcd-data".into();
 
