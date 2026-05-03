@@ -1,7 +1,17 @@
 [package]
-name = "abcd"
+name = "abcd-downloader"
 version = "0.1.0"
 edition = "2024"
+description = "Rust library and CLI for downloading selected models from ABC: A Big CAD Dataset"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+documentation = "https://docs.rs/abcd-downloader"
+keywords = ["cad", "dataset", "abcd", "downloader"]
+categories = ["command-line-utilities", "science"]
+
+[[bin]]
+name = "abcd-downloader"
+path = "src/bin/abcd-downloader.rs"
 
 [dependencies]
 anyhow = "1.0.102"

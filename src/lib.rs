@@ -1,5 +1,4 @@
 use anyhow::{Context, Result, anyhow, bail};
-use clap::{Args, Parser, Subcommand, ValueEnum};
 use directories::ProjectDirs;
 use futures_util::{StreamExt, TryStreamExt, stream};
 use reqwest::Client;
@@ -17,75 +16,15 @@ use tokio::sync::Semaphore;
 const BASE_URL: &str = "https://deep-geometry.github.io/abc-dataset/data";
 const CHUNK_SIZE: usize = 10_000;
 
-#[derive(Parser)]
-#[command(name = "abcd")]
-#[command(about = "Download selected models from ABC: A Big CAD Dataset")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand)]
-enum Command {
-    Download(DownloadArgs),
-    ListFormats,
-    Purge(PurgeArgs),
-}
-
-#[derive(Args, Clone)]
-struct DownloadArgs {
-    #[arg(value_name = "MODEL_SPEC")]
-    specs: Vec<String>,
-
-    #[arg(short, long, value_name = "LIST", default_value = "meta,step,stl")]
-    formats: String,
-
-    #[arg(short, long, value_name = "DIR", default_value = ".")]
-    out: PathBuf,
-
-    #[arg(long, value_name = "DIR")]
-    cache_dir: Option<PathBuf>,
-
-    #[arg(long, default_value_t = default_jobs())]
-    jobs: usize,
-
-    #[arg(long, default_value_t = 2)]
-    download_jobs: usize,
-
-    #[arg(long)]
-    extract_jobs: Option<usize>,
-
-    #[arg(long, default_value = "v00")]
-    version: String,
-
-    #[arg(long, value_enum, default_value_t = VerifyMode::Size)]
-    verify: VerifyMode,
-
-    #[arg(long, value_name = "BYTES_PER_SEC", value_parser = parse_bytes)]
-    rate_limit: Option<u64>,
-
-    #[arg(long)]
-    overwrite: bool,
-
-    #[arg(long)]
-    dry_run: bool,
-}
-
-#[derive(Args)]
-struct PurgeArgs {
-    #[arg(long, value_name = "DIR")]
-    cache_dir: Option<PathBuf>,
-}
-
-#[derive(Copy, Clone, ValueEnum, Eq, PartialEq)]
-enum VerifyMode {
+#[derive(Copy, Clone, Debug, Eq, PartialEq)]
+pub enum VerifyMode {
     None,
     Size,
     Md5,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Ord, PartialOrd, Hash)]
-enum Format {
+pub enum Format {
     Meta,
     Step,
     Para,
@@ -114,42 +53,96 @@ struct ArchiveTask {
     model_ids: Vec<usize>,
 }
 
+impl ArchiveTask {
+    fn planned_event(&self) -> DownloadEvent {
+        DownloadEvent::Planned {
+            chunk: self.chunk,
+            archive_format: self.archive_format,
+            model_count: self.model_ids.len(),
+            archive_name: self.archive_name.clone(),
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct ArchiveMeta {
     sizes: HashMap<String, u64>,
     md5s: HashMap<String, String>,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
-        Command::Download(args) => download(args).await,
-        Command::ListFormats => {
-            list_formats();
-            Ok(())
-        }
-        Command::Purge(args) => {
-            let dir = archive_cache_dir(args.cache_dir)?;
-            if dir.exists() {
-                fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
-            }
-            println!("removed {}", dir.display());
-            Ok(())
+#[derive(Clone)]
+pub struct DownloadOptions {
+    pub model_specs: Vec<String>,
+    pub formats: BTreeSet<Format>,
+    pub out_dir: PathBuf,
+    pub cache_dir: Option<PathBuf>,
+    pub jobs: usize,
+    pub download_jobs: usize,
+    pub extract_jobs: Option<usize>,
+    pub version: String,
+    pub verify: VerifyMode,
+    pub rate_limit: Option<u64>,
+    pub overwrite: bool,
+    pub dry_run: bool,
+    pub reporter: Option<Arc<dyn DownloadReporter>>,
+}
+
+impl Default for DownloadOptions {
+    fn default() -> Self {
+        Self {
+            model_specs: Vec::new(),
+            formats: parse_formats("meta,step,stl").expect("default formats are valid"),
+            out_dir: PathBuf::from("."),
+            cache_dir: None,
+            jobs: default_jobs(),
+            download_jobs: 2,
+            extract_jobs: None,
+            version: "v00".to_owned(),
+            verify: VerifyMode::Size,
+            rate_limit: None,
+            overwrite: false,
+            dry_run: false,
+            reporter: None,
         }
     }
 }
 
-async fn download(args: DownloadArgs) -> Result<()> {
-    if args.specs.is_empty() {
-        bail!("provide model ids/ranges, for example: abcd download 1 2 3-10 ^5");
+pub trait DownloadReporter: Send + Sync {
+    fn report(&self, event: DownloadEvent);
+}
+
+#[derive(Clone, Debug)]
+pub enum DownloadEvent {
+    AllExisting,
+    Planned {
+        chunk: usize,
+        archive_format: &'static str,
+        model_count: usize,
+        archive_name: String,
+    },
+    UsingCached {
+        archive_name: String,
+    },
+    Downloading {
+        archive_name: String,
+    },
+    Extracting {
+        archive_name: String,
+    },
+}
+
+pub async fn download(options: DownloadOptions) -> Result<()> {
+    if options.model_specs.is_empty() {
+        bail!("provide model ids/ranges, for example: abcd-downloader download 1 2 3-10 ^5");
     }
 
-    let formats = parse_formats(&args.formats)?;
-    let ids = parse_model_specs(&args.specs)?;
-    let cache_dir = archive_cache_dir(args.cache_dir.clone())?;
-    let extract_jobs = args.extract_jobs.unwrap_or(args.jobs).max(1);
-    let out = args.out;
+    let reporter = options.reporter.clone();
+    let ids = parse_model_specs(&options.model_specs)?;
+    let cache_dir = archive_cache_dir(options.cache_dir.clone())?;
+    let extract_jobs = options.extract_jobs.unwrap_or(options.jobs).max(1);
+    let out = options.out_dir;
+
+    let formats = options.formats;
 
     fs::create_dir_all(&out).with_context(|| format!("create {}", out.display()))?;
     fs::create_dir_all(&cache_dir).with_context(|| format!("create {}", cache_dir.display()))?;
@@ -157,8 +150,8 @@ async fn download(args: DownloadArgs) -> Result<()> {
     let client = Client::builder().build()?;
     let archive_formats = archive_formats(&formats);
 
-    let manifests = fetch_manifests(&client, &args.version, &archive_formats).await?;
-    let meta = match args.verify {
+    let manifests = fetch_manifests(&client, &options.version, &archive_formats).await?;
+    let meta = match options.verify {
         VerifyMode::None => ArchiveMeta {
             sizes: HashMap::new(),
             md5s: HashMap::new(),
@@ -173,26 +166,20 @@ async fn download(args: DownloadArgs) -> Result<()> {
         },
     };
 
-    let tasks = build_tasks(&ids, &formats, &manifests, &out, args.overwrite)?;
+    let tasks = build_tasks(&ids, &formats, &manifests, &out, options.overwrite)?;
     if tasks.is_empty() {
-        println!("all requested files already exist");
+        report(reporter.as_deref(), DownloadEvent::AllExisting);
         return Ok(());
     }
 
-    if args.dry_run {
+    if options.dry_run {
         for task in &tasks {
-            println!(
-                "chunk {:04} {:<5} {} models -> {}",
-                task.chunk,
-                task.archive_format,
-                task.model_ids.len(),
-                task.archive_name
-            );
+            report(reporter.as_deref(), task.planned_event());
         }
         return Ok(());
     }
 
-    let download_sem = Arc::new(Semaphore::new(args.download_jobs.max(1)));
+    let download_sem = Arc::new(Semaphore::new(options.download_jobs.max(1)));
     let extract_sem = Arc::new(Semaphore::new(extract_jobs));
     let meta = Arc::new(meta);
     let cache_dir = Arc::new(cache_dir);
@@ -201,16 +188,17 @@ async fn download(args: DownloadArgs) -> Result<()> {
 
     stream::iter(tasks)
         .map(Ok::<_, anyhow::Error>)
-        .try_for_each_concurrent(args.jobs.max(1), |task| {
+        .try_for_each_concurrent(options.jobs.max(1), |task| {
             let client = Arc::clone(&client);
             let cache_dir = Arc::clone(&cache_dir);
             let out = Arc::clone(&out);
             let meta = Arc::clone(&meta);
             let download_sem = Arc::clone(&download_sem);
             let extract_sem = Arc::clone(&extract_sem);
-            let verify = args.verify;
-            let overwrite = args.overwrite;
-            let rate_limit = args.rate_limit;
+            let verify = options.verify;
+            let overwrite = options.overwrite;
+            let rate_limit = options.rate_limit;
+            let reporter = reporter.clone();
             async move {
                 let archive_path = cache_dir.join(&task.archive_name);
                 {
@@ -222,6 +210,7 @@ async fn download(args: DownloadArgs) -> Result<()> {
                         verify,
                         &meta,
                         rate_limit,
+                        reporter.as_deref(),
                     )
                     .await?;
                 }
@@ -231,8 +220,15 @@ async fn download(args: DownloadArgs) -> Result<()> {
                     let task_clone = task.clone();
                     let archive_clone = archive_path.clone();
                     let out_clone = Arc::clone(&out);
+                    let extract_reporter = reporter.clone();
                     tokio::task::spawn_blocking(move || {
-                        extract_archive(&archive_clone, &out_clone, &task_clone, overwrite)
+                        extract_archive(
+                            &archive_clone,
+                            &out_clone,
+                            &task_clone,
+                            overwrite,
+                            extract_reporter.as_deref(),
+                        )
                     })
                     .await??;
                 }
@@ -243,6 +239,20 @@ async fn download(args: DownloadArgs) -> Result<()> {
         .await?;
 
     Ok(())
+}
+
+pub fn purge_cache(cache_dir: Option<PathBuf>) -> Result<PathBuf> {
+    let dir = archive_cache_dir(cache_dir)?;
+    if dir.exists() {
+        fs::remove_dir_all(&dir).with_context(|| format!("remove {}", dir.display()))?;
+    }
+    Ok(dir)
+}
+
+fn report(reporter: Option<&dyn DownloadReporter>, event: DownloadEvent) {
+    if let Some(reporter) = reporter {
+        reporter.report(event);
+    }
 }
 
 async fn fetch_manifests(
@@ -279,13 +289,25 @@ async fn fetch_manifests(
 
 async fn fetch_yaml_map_u64(client: &Client, file: &str) -> Result<HashMap<String, u64>> {
     let url = format!("{BASE_URL}/{file}");
-    let text = client.get(&url).send().await?.error_for_status()?.text().await?;
+    let text = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     serde_yaml::from_str(&text).with_context(|| format!("parse {file}"))
 }
 
 async fn fetch_yaml_map_string(client: &Client, file: &str) -> Result<HashMap<String, String>> {
     let url = format!("{BASE_URL}/{file}");
-    let text = client.get(&url).send().await?.error_for_status()?.text().await?;
+    let text = client
+        .get(&url)
+        .send()
+        .await?
+        .error_for_status()?
+        .text()
+        .await?;
     serde_yaml::from_str(&text).with_context(|| format!("parse {file}"))
 }
 
@@ -345,13 +367,24 @@ async fn download_archive(
     verify: VerifyMode,
     meta: &ArchiveMeta,
     rate_limit: Option<u64>,
+    reporter: Option<&dyn DownloadReporter>,
 ) -> Result<()> {
     if archive_path.exists() && archive_ok(archive_path, &task.archive_name, verify, meta)? {
-        println!("using cached {}", task.archive_name);
+        report(
+            reporter,
+            DownloadEvent::UsingCached {
+                archive_name: task.archive_name.clone(),
+            },
+        );
         return Ok(());
     }
 
-    println!("downloading {}", task.archive_name);
+    report(
+        reporter,
+        DownloadEvent::Downloading {
+            archive_name: task.archive_name.clone(),
+        },
+    );
     let part_path = archive_path.with_extension("7z.part");
     let response = client
         .get(&task.url)
@@ -418,21 +451,20 @@ fn extract_archive(
     out: &Path,
     task: &ArchiveTask,
     overwrite: bool,
+    reporter: Option<&dyn DownloadReporter>,
 ) -> Result<()> {
-    println!("extracting {}", task.archive_name);
+    report(
+        reporter,
+        DownloadEvent::Extracting {
+            archive_name: task.archive_name.clone(),
+        },
+    );
     let wanted_ids: HashSet<usize> = task.model_ids.iter().copied().collect();
     let wanted_formats: HashSet<Format> = task.formats.iter().copied().collect();
 
     decompress_file_with_extract_fn(archive_path, out, |entry, reader, _dest| {
-        extract_entry(
-            entry,
-            reader,
-            out,
-            &wanted_ids,
-            &wanted_formats,
-            overwrite,
-        )
-        .map_err(|err| sevenz_rust2::Error::from(io::Error::other(err.to_string())))
+        extract_entry(entry, reader, out, &wanted_ids, &wanted_formats, overwrite)
+            .map_err(|err| sevenz_rust2::Error::from(io::Error::other(err.to_string())))
     })
     .with_context(|| format!("extract {}", archive_path.display()))?;
 
@@ -491,7 +523,12 @@ fn extract_entry(
     Ok(true)
 }
 
-fn unzip_para(zip_path: &Path, model_dir: &Path, formats: &[Format], overwrite: bool) -> Result<()> {
+fn unzip_para(
+    zip_path: &Path,
+    model_dir: &Path,
+    formats: &[Format],
+    overwrite: bool,
+) -> Result<()> {
     let want_xt = formats.contains(&Format::Xt);
     let want_xb = formats.contains(&Format::Xb);
     if !want_xt && !want_xb {
@@ -536,7 +573,7 @@ fn model_has_format(out: &Path, id: usize, format: Format) -> bool {
     })
 }
 
-fn parse_model_specs(specs: &[String]) -> Result<BTreeSet<usize>> {
+pub fn parse_model_specs(specs: &[String]) -> Result<BTreeSet<usize>> {
     let mut include = BTreeSet::new();
     let mut exclude = BTreeSet::new();
 
@@ -609,7 +646,7 @@ fn parse_id(spec: &str) -> Result<usize> {
         .with_context(|| format!("invalid model id: {spec}"))
 }
 
-fn parse_formats(input: &str) -> Result<BTreeSet<Format>> {
+pub fn parse_formats(input: &str) -> Result<BTreeSet<Format>> {
     input
         .split(',')
         .map(|part| {
@@ -633,7 +670,10 @@ fn parse_formats(input: &str) -> Result<BTreeSet<Format>> {
 }
 
 fn archive_formats(formats: &BTreeSet<Format>) -> BTreeSet<&'static str> {
-    formats.iter().map(|format| format.archive_format()).collect()
+    formats
+        .iter()
+        .map(|format| format.archive_format())
+        .collect()
 }
 
 impl Format {
@@ -684,7 +724,7 @@ fn entry_model_id(name: &str) -> Option<usize> {
     prefix.parse().ok()
 }
 
-fn parse_bytes(input: &str) -> Result<u64, String> {
+pub fn parse_bytes(input: &str) -> Result<u64, String> {
     let input = input.trim();
     let number_end = input
         .find(|ch: char| !ch.is_ascii_digit() && ch != '.')
@@ -708,24 +748,29 @@ fn archive_cache_dir(cache_dir: Option<PathBuf>) -> Result<PathBuf> {
         return Ok(cache_dir);
     }
 
-    let dirs = ProjectDirs::from("", "", "abcd")
+    let dirs = ProjectDirs::from("", "", "abcd-downloader")
         .ok_or_else(|| anyhow!("could not determine XDG cache directory"))?;
     Ok(dirs.cache_dir().join("archives"))
 }
 
-fn default_jobs() -> usize {
+pub fn default_jobs() -> usize {
     std::thread::available_parallelism().map_or(4, usize::from)
 }
 
-fn list_formats() {
-    println!("meta            metadata yml");
-    println!("step            STEP boundary representation");
-    println!("stl, stl2       merged STL mesh from official stl2 chunks");
-    println!("para            Parasolid zip from ABC para chunks");
-    println!("xt, x_t         extracted Parasolid text parts from para zip");
-    println!("xb, x_b         extracted Parasolid binary parts from para zip when present");
-    println!("obj             mesh OBJ");
-    println!("feat            feature yml");
-    println!("stat            statistics yml");
-    println!("ofs             FeatureScript yml");
+pub fn format_descriptions() -> &'static [(&'static str, &'static str)] {
+    &[
+        ("meta", "metadata yml"),
+        ("step", "STEP boundary representation"),
+        ("stl, stl2", "merged STL mesh from official stl2 chunks"),
+        ("para", "Parasolid zip from ABC para chunks"),
+        ("xt, x_t", "extracted Parasolid text parts from para zip"),
+        (
+            "xb, x_b",
+            "extracted Parasolid binary parts from para zip when present",
+        ),
+        ("obj", "mesh OBJ"),
+        ("feat", "feature yml"),
+        ("stat", "statistics yml"),
+        ("ofs", "FeatureScript yml"),
+    ]
 }
