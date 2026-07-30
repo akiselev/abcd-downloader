@@ -542,8 +542,8 @@ fn unzip_para(
         let Some(name) = zipped.enclosed_name().map(PathBuf::from) else {
             continue;
         };
-        let is_xt = name.extension().is_some_and(|ext| ext == "x_t");
-        let is_xb = name.extension().is_some_and(|ext| ext == "x_b");
+        let is_xt = extension_eq(&name, "x_t");
+        let is_xb = extension_eq(&name, "x_b");
         if (!want_xt || !is_xt) && (!want_xb || !is_xb) {
             continue;
         }
@@ -707,8 +707,14 @@ impl Format {
 
     fn matches_output_name(self, name: &str) -> bool {
         match self {
-            Format::Xt => name.ends_with(".x_t"),
-            Format::Xb => name.ends_with(".x_b"),
+            Format::Xt => Path::new(name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("x_t")),
+            Format::Xb => Path::new(name)
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .is_some_and(|extension| extension.eq_ignore_ascii_case("x_b")),
             _ => self.matches_entry(name),
         }
     }
@@ -716,6 +722,12 @@ impl Format {
     fn unzip_para(self) -> bool {
         matches!(self, Format::Xt | Format::Xb)
     }
+}
+
+fn extension_eq(path: &Path, expected: &str) -> bool {
+    path.extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case(expected))
 }
 
 fn entry_model_id(name: &str) -> Option<usize> {
@@ -773,4 +785,19 @@ pub fn format_descriptions() -> &'static [(&'static str, &'static str)] {
         ("stat", "statistics yml"),
         ("ofs", "FeatureScript yml"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parasolid_member_extensions_are_case_insensitive() {
+        assert!(extension_eq(Path::new("part.x_t"), "x_t"));
+        assert!(extension_eq(Path::new("part.X_T"), "x_t"));
+        assert!(extension_eq(Path::new("part.x_b"), "x_b"));
+        assert!(extension_eq(Path::new("part.X_B"), "x_b"));
+        assert!(Format::Xt.matches_output_name("part.X_T"));
+        assert!(Format::Xb.matches_output_name("part.X_B"));
+    }
 }
